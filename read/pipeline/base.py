@@ -13,7 +13,6 @@ from transformers import (
     DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
-    pipeline,
 )
 from torchmetrics import (
     Precision,
@@ -23,10 +22,11 @@ from torchmetrics import (
     RetrievalRecall,
     RetrievalHitRate,
     RetrievalMRR,
-    Accuracy
+    Accuracy,
 )
 import json
 import torch
+from transformers import T5Tokenizer, T5ForConditionalGeneration
 
 
 def tokenize(tokenizer, tokenizer_type, x):
@@ -89,7 +89,6 @@ class SentenceSelection(Step):
                 sentences.append(sent)
                 ids.append(idx)
 
-
         assert max(ids) == len(data) - 1
         for i in range(0, len(tables), 10000):
             with training_args.main_process_first(desc="dataset map pre-processing"):
@@ -120,7 +119,7 @@ class SentenceSelection(Step):
             sentence_results[id][1].append((sent, pred))
             sentence_results[id][2] = (
                 data[id]["linearized_table"],
-                data[id]["sentence"] if "sentence" in data[id] else ""
+                data[id]["sentence"] if "sentence" in data[id] else "",
             )
         return sentence_results
 
@@ -178,7 +177,9 @@ class TableVerification(Step):
             data_collator=collator,
         )
 
-        outputs = trainer.predict(dataset, ignore_keys=["past_key_values", "encoder_last_hidden_state"]).predictions
+        outputs = trainer.predict(
+            dataset, ignore_keys=["past_key_values", "encoder_last_hidden_state"]
+        ).predictions
 
         all_preds = np.argmax(outputs, axis=1).tolist()
         scores = softmax(outputs, axis=1)[:, 1].tolist()
@@ -205,7 +206,13 @@ class CellCorrection(Step):
     DETERMINISTIC: bool = True
     CACHEABLE: bool = True
     FORMAT: Format = JsonFormat()
-    VERSION: Optional[str] = "0078"
+    VERSION: Optional[str] = "00791"
+
+    def run_model(self, tokenizer, model, question, context, **generator_args):
+        input_string = f"{question}\\n{context}"
+        input_ids = tokenizer.encode(input_string, return_tensors="pt")
+        res = model.generate(input_ids, **generator_args)
+        return tokenizer.batch_decode(res, skip_special_tokens=True)
 
     def choose_question(self, table, column):
         if (
@@ -215,13 +222,12 @@ class CellCorrection(Step):
             or "start" in column.lower()
             or "end" in column.lower()
             or "day" in column.lower()
+            or "time" in column.lower()
         ):
-            return "When is ?"
-        if "time" in column.lower():
-            return "What time ?"
+            return "When did this happened?"
         try:
             datetime.strptime(table[column][0])
-            return "When ?"
+            return "When did this happened??"
         except:
             pass
 
@@ -251,10 +257,14 @@ class CellCorrection(Step):
             return True
 
     def run(self, data, verified_results):
-        model_name = "deepset/roberta-base-squad2"
+        model_name = "deepset/xlm-roberta-large-squad2"
+
+        model_name = "allenai/unifiedqa-t5-small"  # you can specify the model size here
+        tokenizer = T5Tokenizer.from_pretrained(model_name)
+        model = T5ForConditionalGeneration.from_pretrained(model_name)
 
         # a) Get predictions
-        nlp = pipeline("question-answering", model=model_name, tokenizer=model_name)
+        # nlp = pipeline("question-answering", model=model_name, tokenizer=model_name)
 
         results = []
         for i, (example, result) in enumerate(zip(data, verified_results)):
@@ -277,23 +287,31 @@ class CellCorrection(Step):
             for column in sub_table.columns:
                 if column == "index":
                     continue
-                for sent in sents:
+                for sent, score, _, _, _ in sents:
                     question = self.choose_question(sub_table, column)
                     # input_string = question + "\\n" + sent[0]
-                    answer = nlp({"question": question, "context": sent[0]})
-                    print(question, sent[0], answer, sub_table)
-                    if answer["score"] < 0.2:
-                        continue
+                    answer = self.run_model(
+                        tokenizer,
+                        model,
+                        question=question,
+                        context=sent,
+                        temperature=0.9,
+                        num_return_sequences=1,
+                        num_beams=5,
+                    )
+                    print(question, sent, answer, sub_table, score)
+                    # if answer["score"] < 0.2:
+                    #     continue
 
                     if (
                         jaro.jaro_winkler_metric(
-                            answer["answer"], sub_table.loc[0, column]
+                            answer[0], sub_table.loc[0, column]
                         )
                         > 0.8
                     ):
                         continue
                     else:
-                        res.append((sub_table[column][0], answer["score"]))
+                        res.append((sub_table[column][0]))
                         break
             results.append(res)
         return results
@@ -308,14 +326,13 @@ class Evaluation(Step):
 
     step2name2metrics = {
         x: {
-        "accuracy": RetrievalHitRate(),
-        "recall": RetrievalRecall(),
-        "precision": RetrievalPrecision(),
-        "mrr": RetrievalMRR(),
+            "accuracy": RetrievalHitRate(),
+            "recall": RetrievalRecall(),
+            "precision": RetrievalPrecision(),
+            "mrr": RetrievalMRR(),
         }
         for x in ["sentence_selection", "cell_correction", "document_retrieval"]
     }
-
 
     step2name2metrics["table_verification"] = {
         "accuracy": Accuracy(),
@@ -342,9 +359,8 @@ class Evaluation(Step):
                 replaced_row,
                 valid_column,
             ) = json.loads(example["negatives"])
-            for res, score in result:
-                print(replaced_value, res, self.jaccard_similarity(replaced_value, res), score)
-                if self.jaccard_similarity(replaced_value, res) > 0.7:
+            for res in result:
+                if self.jaccard_similarity(replaced_value, res) > 0.9:
                     labels.append(1)
                 else:
                     labels.append(0)
@@ -361,10 +377,7 @@ class Evaluation(Step):
             for sent, pred in result:
                 if pred == 1:
                     sentence = example["sentence"] if "sentence" in example else ""
-                    if (
-                        self.jaccard_similarity(sent.split(), sentence.split())
-                        > 0.7
-                    ):
+                    if self.jaccard_similarity(sent.split(), sentence.split()) > 0.7:
                         labels.append(1)
                     else:
                         labels.append(0)
@@ -393,13 +406,21 @@ class Evaluation(Step):
 
         return preds, labels, indices
 
-    def run(self, data, doc_results, sentence_results, verified_results, correction_results):
+    def run(
+        self, data, doc_results, sentence_results, verified_results, correction_results
+    ):
         sentence_results = [x[1] for x in sentence_results]
-        doc_preds, doc_labels, doc_indices = self.process_document_retrieval(data, doc_results)
-        sentence_preds, sentence_labels, sentence_indices = self.process_sentence_selection(
-            data, sentence_results
+        doc_preds, doc_labels, doc_indices = self.process_document_retrieval(
+            data, doc_results
         )
-        cell_preds, cell_labels, cell_indices = self.process_cell_correction(data, correction_results)
+        (
+            sentence_preds,
+            sentence_labels,
+            sentence_indices,
+        ) = self.process_sentence_selection(data, sentence_results)
+        cell_preds, cell_labels, cell_indices = self.process_cell_correction(
+            data, correction_results
+        )
 
         result = collections.defaultdict(dict)
         step2failed_cases = collections.defaultdict(list)
@@ -414,7 +435,7 @@ class Evaluation(Step):
                 "document_retrieval",
                 "sentence_selection",
                 "table_verification",
-                "cell_correction"
+                "cell_correction",
             ],
             [doc_preds, sentence_preds, [x[0] for x in verified_results], cell_preds],
             [
@@ -429,11 +450,17 @@ class Evaluation(Step):
             for name, metric in self.step2name2metrics[step].items():
                 if indices is not None:
                     print(step, name)
-                    result[step][f"{name}"] = metric(torch.tensor(preds).float(), torch.tensor(labels), indexes=torch.tensor(indices))
+                    result[step][f"{name}"] = metric(
+                        torch.tensor(preds).float(),
+                        torch.tensor(labels),
+                        indexes=torch.tensor(indices),
+                    )
                     for pred, label, index in zip(preds, labels, indices):
                         if pred != label:
                             step2failed_cases[step].append((data[index], errors[index]))
                 else:
-                    result[step][f"{name}"] = metric(torch.tensor(preds).float(), torch.tensor(labels))
+                    result[step][f"{name}"] = metric(
+                        torch.tensor(preds).float(), torch.tensor(labels)
+                    )
 
         return {"result": result, "failed_cases": step2failed_cases}
